@@ -1,36 +1,39 @@
 {-# LANGUAGE OverloadedStrings #-}
 
 module Lib
-  (
+  ( sockHandler,
+    version,
   )
 where
 
-import Control.Concurrent.STM (TVar, atomically, modifyTVar, readTVar)
-import Data.Attoparsec.ByteString (count)
-import Data.Attoparsec.ByteString.Char8
-  ( Parser,
-    char,
-    choice,
-    decimal,
-    endOfLine,
-    signed,
-    take,
+import Control.Concurrent (forkIO)
+import Control.Concurrent.STM
+  ( TVar,
+    atomically,
+    modifyTVar,
+    readTVar,
   )
-import Data.ByteString.Char8 (ByteString)
-import Data.Map (Map)
+import Data.Attoparsec.ByteString.Char8 hiding (takeTill)
+import qualified Data.ByteString as S
+import Data.ByteString.Char8 (ByteString, pack)
+import Data.Map hiding (take)
 import Network.Socket
+import System.IO (Handle, IOMode (ReadMode), hSetBinaryMode)
 import Prelude hiding (lookup, take)
 
-type Value = ByteString
+version :: ByteString
+version = "0.5.0"
 
 type Key = ByteString
+
+type Value = ByteString
 
 type DB = Map Key Value
 
 data Command
   = Get Key
   | Set Key Value
-  | Unkown
+  | Unknown
   deriving (Eq, Show)
 
 data Reply
@@ -43,7 +46,7 @@ parseReply (MultiBulk (Just xs)) =
   case xs of
     [Bulk (Just "get"), Bulk (Just a)] -> Just $ Get a
     [Bulk (Just "set"), Bulk (Just a), Bulk (Just b)] -> Just $ Set a b
-    _ -> Just Unkown
+    _ -> Just Unknown
 parseReply _ = Nothing
 
 replyParser :: Parser Reply
@@ -63,20 +66,60 @@ multiBulk =
     len <- char '*' *> signed decimal <* endOfLine
     if len < 0
       then return Nothing
-      else Just <$> count len replyParsert
+      else Just <$> count len replyParser
+
+hGetReplies :: Handle -> Parser a -> IO a
+hGetReplies h parser = go S.empty
+  where
+    go rest = do
+      parseResult <- parseWith readMore parser rest
+      case parseResult of
+        Fail _ _ s -> error s
+        Partial {} -> error "error: partial"
+        Done _ r -> return r
+
+    readMore = S.hGetSome h (4 * 1024)
+
+crlf :: ByteString
+crlf = "\r\n"
+
+ok :: ByteString
+ok = "+OK\r\n"
 
 sockHandler :: Socket -> TVar DB -> IO ()
 sockHandler sock db = do
-  (handle, _, _) <- accept sock
-  hSetBuffering handle NoBuffering
+  (socket, _) <- accept sock
+  handle <- socketToHandle socket ReadMode
   hSetBinaryMode handle True
   _ <- forkIO $ commandProcessor handle db
   sockHandler sock db
 
--- STM (software transactional memory) - change the value
+runCommand :: Handle -> Maybe Command -> TVar DB -> IO ()
+runCommand handle (Just (Get key)) db = do
+  m <- atomRead db
+  let value = getValue m key
+  S.hPutStr handle $ S.concat ["$", valLength value, crlf, value, crlf]
+  where
+    valLength :: Value -> ByteString
+    valLength = pack . show . S.length
+runCommand handle (Just (Set key value)) db = do
+  updateValue (insert key value) db
+  S.hPutStr handle ok
+runCommand handle (Just Unknown) _ =
+  S.hPutStr handle $ S.concat ["-ERR ", "unknown command", crlf]
+runCommand _ Nothing _ = return ()
+
+commandProcessor :: Handle -> TVar DB -> IO ()
+commandProcessor handle db = do
+  reply <- hGetReplies handle replyParser
+  let command = parseReply reply
+  runCommand handle command db
 
 atomRead :: TVar a -> IO a
 atomRead = atomically . readTVar
 
 updateValue :: (DB -> DB) -> TVar DB -> IO ()
 updateValue fn x = atomically $ modifyTVar x fn
+
+getValue :: DB -> Key -> Value
+getValue db k = findWithDefault "null" k db
