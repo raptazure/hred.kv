@@ -12,13 +12,25 @@ import Control.Concurrent.STM
     atomically,
     modifyTVar,
     readTVar,
+    readTVarIO,
   )
-import Data.Attoparsec.ByteString.Char8 hiding (takeTill)
+import Data.Attoparsec.ByteString.Char8
+  ( IResult (Done, Fail, Partial),
+    Parser,
+    char,
+    choice,
+    count,
+    decimal,
+    endOfLine,
+    parseWith,
+    signed,
+    take,
+  )
 import qualified Data.ByteString as S
 import Data.ByteString.Char8 (ByteString, pack)
-import Data.Map hiding (take)
-import Network.Socket
-import System.IO (Handle, IOMode (ReadMode), hSetBinaryMode)
+import Data.Map (Map, findWithDefault, insert)
+import Network.Socket (Socket, accept, socketToHandle)
+import System.IO (BufferMode (NoBuffering), Handle, IOMode (ReadMode, ReadWriteMode), hSetBinaryMode, hSetBuffering)
 import Prelude hiding (lookup, take)
 
 version :: ByteString
@@ -89,7 +101,8 @@ ok = "+OK\r\n"
 sockHandler :: Socket -> TVar DB -> IO ()
 sockHandler sock db = do
   (socket, _) <- accept sock
-  handle <- socketToHandle socket ReadMode
+  handle <- socketToHandle socket ReadWriteMode
+  hSetBuffering handle NoBuffering
   hSetBinaryMode handle True
   _ <- forkIO $ commandProcessor handle db
   sockHandler sock db
@@ -116,7 +129,7 @@ commandProcessor handle db = do
   runCommand handle command db
 
 atomRead :: TVar a -> IO a
-atomRead = atomically . readTVar
+atomRead = readTVarIO
 
 updateValue :: (DB -> DB) -> TVar DB -> IO ()
 updateValue fn x = atomically $ modifyTVar x fn
